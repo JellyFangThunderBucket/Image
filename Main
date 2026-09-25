@@ -2,7 +2,7 @@
 // @name           以图搜图增强版
 // @name:en        Enhanced Reverse Image Search
 // @namespace      https://github.com/belingud/GM.UserScript
-// @version        1.4.0
+// @version        2.0.0
 // @description    以图搜图增强版，可以使用本地文件、粘贴链接、点击网页图片方式来搜图。支持谷歌Lens、TinEye、Yandex、Copyseeker、Bing、搜狗、百度、trace、SauceNAO、IQDB、3DIQDB、ascii2d搜索引擎。
 // @description:en Enhanced Reverse image search. You can search images using local files, pasting links, and clicking web images. Supports Google Lens, TinEye, Yandex, Copyseeker, Bing, Sogou, Baidu, trace, SauceNAO, IQDB, 3DIQDB, ascii2d search engines.
 // @icon           https://cdn.jsdelivr.net/gh/belingud/GM.UserScript@refs/heads/master/artwork/icon.png
@@ -61,6 +61,9 @@
             pasteDialogUploading: "Uploading...",
             pasteDialogCancel: "Cancel",
             copyseekerUrlOnly: "Copyseeker only supports http/https image URLs.",
+            invalidURL: "Enter a valid http/https image URL.",
+            invalidFile: "Choose a supported image file (20 MB or smaller).",
+            searchFailed: "The search could not be started. Please try again.",
         },
         zh: {
             selectImageSource: "选择图片来源：",
@@ -98,6 +101,9 @@
             pasteDialogUploading: "上传中...",
             pasteDialogCancel: "取消",
             copyseekerUrlOnly: "Copyseeker 只支持 http/https 图片链接。",
+            invalidURL: "请输入有效的 http/https 图片链接。",
+            invalidFile: "请选择受支持且不超过 20 MB 的图片。",
+            searchFailed: "无法启动搜索，请重试。",
         },
     };
 
@@ -113,6 +119,10 @@
     const menuSizeKey = "ris_menu_size";
     const minMenuWidth = 180;
     const minMenuHeight = 180;
+    const maxUploadBytes = 20 * 1024 * 1024;
+    const uploadTimeoutMs = 30000;
+    let pendingUpload = null;
+    let cancelImagePicker = null;
 
     const searchUrl = {
         "Google Lens": `https://lens.google.com/uploadbyurl?url=\${url}`,
@@ -128,6 +138,27 @@
         "3DIQDB": `https://3d.iqdb.org/?url=\${url}`,
         ascii2d: `https://ascii2d.net/search/url/\${url}`,
     };
+
+    function normalizeImageUrl(value) {
+        if (typeof value !== "string") return "";
+        const input = value.trim();
+        if (!input) return "";
+        try {
+            const url = new URL(input, document.baseURI);
+            return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+        } catch (_error) {
+            return "";
+        }
+    }
+
+    function isValidImageFile(candidate) {
+        return Boolean(candidate
+            && typeof candidate.size === "number"
+            && candidate.size > 0
+            && candidate.size <= maxUploadBytes
+            && typeof candidate.type === "string"
+            && candidate.type.startsWith("image/"));
+    }
 
     const searchEngines = [
         {
@@ -625,6 +656,7 @@
 
     // Function to create and open the menu
     function openMenu() {
+        cancelImagePicker?.();
         // Remove any existing menu
         const existingMenu = document.getElementById("reverse-image-search-menu");
         if (existingMenu) {
@@ -653,7 +685,8 @@
         content.appendChild(sourceTitle);
 
         imageSources.forEach((source) => {
-            const sourceOption = document.createElement("div");
+            const sourceOption = document.createElement("button");
+            sourceOption.type = "button";
             sourceOption.className = "ris-option";
             sourceOption.textContent = source.text;
             sourceOption.id = source.id;
@@ -673,14 +706,19 @@
         content.appendChild(engineTitle);
 
         searchEngines.forEach((engine) => {
-            const engineOption = document.createElement("div");
+            const engineOption = document.createElement("button");
+            engineOption.type = "button";
             engineOption.className = "ris-option";
             engineOption.textContent = engine.text;
             engineOption.addEventListener("click", async () => {
                 if (imgType === "file" && file) {
                     showLoading(menu); // Show loading animation
                 }
-                await engine.handler();
+                try {
+                    await engine.handler();
+                } finally {
+                    hideLoading();
+                }
             });
             content.appendChild(engineOption);
         });
@@ -715,11 +753,21 @@
     // Handle select file
     function selectFile() {
         imgType = "file";
+        file = "";
+        imageSrc = "";
         const input = document.createElement("input");
         input.type = "file";
         input.accept = "image/*";
         input.addEventListener("change", (event) => {
-            file = event.target.files[0];
+            const candidate = event.target.files[0];
+            if (!isValidImageFile(candidate)) {
+                file = "";
+                imgType = "";
+                showToast(lang("invalidFile"), "error");
+                return;
+            }
+            file = candidate;
+            imageSrc = "";
             markSelected("select-file");
         });
         input.click();
@@ -727,30 +775,57 @@
 
     // Handle paste URL
     function pasteURL() {
-        imgType = "url";
-        const url = prompt(lang("pasteURLPrompt"));
+        const input = prompt(lang("pasteURLPrompt"));
+        if (input === null) return;
+        const url = normalizeImageUrl(input);
         if (url) {
+            imgType = "url";
+            file = "";
             imageSrc = url;
             markSelected("paste-url");
+        } else {
+            imgType = "";
+            showToast(lang("invalidURL"), "error");
         }
     }
 
     // Handle click image
     function clickImage() {
         imgType = "page";
-        document.body.addEventListener("click", function handleClick(event) {
-            if (event.target.tagName === "IMG") {
-                imageSrc = event.target.src;
-                document.body.removeEventListener("click", handleClick);
+        file = "";
+        imageSrc = "";
+        cancelImagePicker?.();
+        const cleanup = () => {
+            document.removeEventListener("click", handleClick, true);
+            document.removeEventListener("keydown", handleKeydown, true);
+            cancelImagePicker = null;
+        };
+        const handleKeydown = (event) => {
+            if (event.key === "Escape") cleanup();
+        };
+        const handleClick = (event) => {
+            const image = event.target.closest?.("img");
+            if (image && !image.closest("#reverse-image-search-menu")) {
+                const selectedUrl = normalizeImageUrl(image.currentSrc || image.src);
+                if (!selectedUrl) return;
+                imageSrc = selectedUrl;
+                file = "";
+                cleanup();
                 markSelected("click-image");
-                event.preventDefault(); // Prevent default link behavior
+                event.preventDefault();
+                event.stopPropagation();
             }
-        });
+        };
+        cancelImagePicker = cleanup;
+        document.addEventListener("click", handleClick, true);
+        document.addEventListener("keydown", handleKeydown, true);
     }
 
     // Handle paste image from clipboard
     function pasteImage() {
         imgType = "clipboard";
+        file = "";
+        imageSrc = "";
 
         const overlay = document.createElement("div");
         overlay.className = "ris-paste-overlay";
@@ -820,6 +895,11 @@
             cancelBtn.remove();
 
             const uploadFile = new File([imageBlob], "clipboard-image.png", { type: imageBlob.type });
+            if (!isValidImageFile(uploadFile)) {
+                overlay.remove();
+                showToast(lang("invalidFile"), "error");
+                return;
+            }
             imageSrc = await getUploadedImageLink(uploadFile);
             overlay.remove();
             if (imageSrc) {
@@ -832,13 +912,17 @@
 
     // Perform image search
     async function searchImage() {
+        if (!imgType) {
+            showToast(lang("selectImageFirst"), "error");
+            return;
+        }
         if (!file && imgType === "file") {
             showToast(lang("pleaseSelectFile"), "error");
             return;
         }
         if (imgType === "file") {
-            imageSrc = await getUploadedImageLink(file);
-            hideLoading(); // Hide loading animation after getting the link
+            pendingUpload ||= getUploadedImageLink(file).finally(() => { pendingUpload = null; });
+            imageSrc = await pendingUpload;
         }
         if (!imageSrc) {
             return;
@@ -847,14 +931,18 @@
             triggerCopyseekerSearch(imageSrc);
             return;
         }
-        let tmp;
-        if (selectedEngine !== "ascii2d") {
-            tmp = encodeURIComponent(imageSrc);
-        } else {
-            tmp = imageSrc;
+        const template = searchUrl[selectedEngine];
+        if (!template) {
+            showToast(lang("searchFailed"), "error");
+            return;
         }
-        let target = searchUrl[selectedEngine].replace("${url}", tmp);
-        GM_openInTab(target, { active: true, insert: true, setParent: true });
+        const target = template.replace("${url}", encodeURIComponent(imageSrc));
+        try {
+            GM_openInTab(target, { active: true, insert: true, setParent: true });
+        } catch (error) {
+            console.error("[reverse image search] open error", error);
+            showToast(lang("searchFailed"), "error");
+        }
     }
 
     function triggerCopyseekerSearch(url) {
@@ -873,6 +961,7 @@
     }
 
     async function uploadToUguu(file) {
+        if (!isValidImageFile(file)) throw new TypeError("Invalid image file");
         const formData = new FormData();
         formData.append("files[]", file, file.name || "image.png");
         const response = new Promise((resolve, reject) => {
@@ -880,21 +969,35 @@
                 method: "POST",
                 url: "https://uguu.se/upload",
                 data: formData,
+                timeout: uploadTimeoutMs,
                 onload: function (response) {
                     if (response.status !== 200) {
                         reject(response.responseText);
                         return;
                     }
-                    const resp = JSON.parse(response.responseText);
-                    console.log("upload response: ", resp);
+                    let resp;
+                    try {
+                        resp = JSON.parse(response.responseText);
+                    } catch (_error) {
+                        reject(new Error("Upload service returned invalid JSON"));
+                        return;
+                    }
                     if (!resp.success || !resp.files || !resp.files[0] || !resp.files[0].url) {
                         reject(resp);
                         return;
                     }
-                    resolve(resp.files[0].url);
+                    const uploadedUrl = normalizeImageUrl(resp.files[0].url);
+                    if (!uploadedUrl) {
+                        reject(new Error("Upload service returned an invalid URL"));
+                        return;
+                    }
+                    resolve(uploadedUrl);
                 },
                 onerror: function (response) {
                     reject(response);
+                },
+                ontimeout: function () {
+                    reject(new Error("Upload timed out"));
                 },
             });
         });
@@ -909,8 +1012,9 @@
         try {
             return await uploadToUguu(file);
         } catch (error) {
-            console.log("[reverse image search] upload error: ", error);
+            console.error("[reverse image search] upload error: ", error);
             showToast(lang("uploadError"), "error");
+            return "";
         }
     }
 
@@ -941,6 +1045,7 @@
      * @param {HTMLElement} menu - The menu element
      */
     function showLoading(menu) {
+        hideLoading();
         const loadingDiv = document.createElement("div");
         loadingDiv.id = "loading-animation";
         loadingDiv.className = "ris-loading";
@@ -1214,11 +1319,12 @@
             pos2 = 0,
             pos3 = 0,
             pos4 = 0;
-        element.onmousedown = dragMouseDown;
+        element.addEventListener("mousedown", dragMouseDown);
 
         function dragMouseDown(e) {
             e = e || window.event;
             if (e.target && e.target.closest && e.target.closest(".ris-resize-handle")) return;
+            if (e.target && e.target.closest && e.target.closest("button, input, textarea, [contenteditable]")) return;
             e.preventDefault();
             const rect = element.getBoundingClientRect();
             element.style.left = `${rect.left}px`;
@@ -1227,9 +1333,9 @@
             // get the mouse cursor position at startup:
             pos3 = e.clientX;
             pos4 = e.clientY;
-            document.onmouseup = closeDragElement;
+            document.addEventListener("mouseup", closeDragElement);
             // call a function whenever the cursor moves:
-            document.onmousemove = elementDrag;
+            document.addEventListener("mousemove", elementDrag);
         }
 
         function elementDrag(e) {
@@ -1241,15 +1347,21 @@
             pos3 = e.clientX;
             pos4 = e.clientY;
             // set the element's new position:
-            element.style.top = element.offsetTop - pos2 + "px";
-            element.style.left = element.offsetLeft - pos1 + "px";
+            const maxLeft = Math.max(0, window.innerWidth - element.offsetWidth);
+            const maxTop = Math.max(0, window.innerHeight - element.offsetHeight);
+            element.style.top = `${Math.min(maxTop, Math.max(0, element.offsetTop - pos2))}px`;
+            element.style.left = `${Math.min(maxLeft, Math.max(0, element.offsetLeft - pos1))}px`;
         }
 
         function closeDragElement() {
             // stop moving when mouse button is released:
-            document.onmouseup = null;
-            document.onmousemove = null;
+            document.removeEventListener("mouseup", closeDragElement);
+            document.removeEventListener("mousemove", elementDrag);
         }
+    }
+
+    if (typeof globalThis !== "undefined" && globalThis.__RIS_ENABLE_TEST_API__) {
+        globalThis.__RIS_TEST_API__ = { normalizeImageUrl, isValidImageFile, clampMenuSize };
     }
 
     autoSubmitCopyseekerSearch();
